@@ -5,26 +5,61 @@ let returns = [];
 let rsiValues = [];
 let estimatedTomorrow = 0;
 
-const SYMBOL = 'SNDK';
+let symbolInput;
+let loadButton;
+let currentSymbol = 'SNDK';
+
 const LOOKBACK = 252;
 const RSI_PERIOD = 14;
-const TEMPERATURE = 1.0;   // 0.5 = sharper, 1.0 = normal, 1.5–2.5 = smoother
+const TEMPERATURE = 1.0;
 
-async function setup() {
+function setup() {
   createCanvas(1100, 980);
   textFont('monospace');
   
-  closes = await loadStockCloses(SYMBOL, LOOKBACK);
+  // --- UI Controls ---
+  symbolInput = createInput(currentSymbol);
+  symbolInput.position(40, 20);
+  symbolInput.size(120);
+  symbolInput.attribute('placeholder', 'Symbol');
+  
+  loadButton = createButton('Load');
+  loadButton.position(175, 20);
+  loadButton.mousePressed(loadNewSymbol);
+  
+  // Initial load
+  loadNewSymbol();
+}
+
+async function loadNewSymbol() {
+  currentSymbol = symbolInput.value().trim().toUpperCase() || 'SNDK';
+  
+  // Clear previous data
+  closes = [];
+  returns = [];
+  rsiValues = [];
+  tomorrowProbs = [];
+  estimatedTomorrow = 0;
+  markov = null;
+  
+  // Show loading message
+  background(18);
+  fill(200);
+  textSize(16);
+  text(`Loading ${currentSymbol}...`, 40, 100);
+  
+  closes = await loadStockCloses(currentSymbol, LOOKBACK);
   
   if (closes.length < 30) {
-    background(20);
+    background(18);
     fill(255, 80, 80);
     textSize(16);
-    text('Failed to load enough data for ' + SYMBOL, 40, 100);
+    text(`Failed to load enough data for ${currentSymbol}`, 40, 100);
     return;
   }
   
   // Daily returns
+  returns = [];
   for (let i = 1; i < closes.length; i++) {
     returns.push((closes[i] - closes[i - 1]) / closes[i - 1]);
   }
@@ -32,16 +67,17 @@ async function setup() {
   // RSI
   rsiValues = calculateRSI(closes, RSI_PERIOD);
   
+  // Markov model
   markov = new MarkovTree(closes);
   tomorrowProbs = markov.predictTomorrow();
   
-  // Probability-weighted estimate of tomorrow's closing price
+  // Probability-weighted estimate
   estimatedTomorrow = 0;
   for (let p of tomorrowProbs) {
     estimatedTomorrow += p.prob * p.estimatedPrice;
   }
   
-  noLoop();
+  redraw();
 }
 
 async function loadStockCloses(symbol, lookback) {
@@ -118,16 +154,18 @@ function percentile(arr, p) {
 
 function draw() {
   background(18);
+  
+  // Leave space for the input controls at the top
   fill(230);
   textSize(18);
-  text(`${SYMBOL} – Price + RSI + Markov (Softmax T=${TEMPERATURE})`, 20, 28);
+  text(`${currentSymbol} – Price + RSI + Markov (Softmax T=${TEMPERATURE})`, 40, 70);
   textSize(12);
-  text(`Last ${closes.length} trading days  |  RSI period: ${RSI_PERIOD}`, 20, 48);
+  text(`Last ${closes.length} trading days  |  RSI period: ${RSI_PERIOD}`, 40, 90);
   
-  if (closes.length === 0) return;
+  if (closes.length === 0 || !markov) return;
   
-  drawPriceChart(40, 65, width - 80, 220);
-  drawRSIChart(40, 310, width - 80, 140);
+  drawPriceChart(40, 110, width - 80, 200);
+  drawRSIChart(40, 335, width - 80, 130);
   
   // Today's price + estimated tomorrow price
   let todayClose = closes[closes.length - 1];
@@ -136,18 +174,18 @@ function draw() {
   
   fill(230);
   textSize(14);
-  text(`Today: $${nf(todayClose, 0, 2)}`, 40, 480);
+  text(`Today: $${nf(todayClose, 0, 2)}`, 40, 500);
   
   if (change >= 0) fill(80, 220, 120);
   else fill(255, 100, 100);
   
-  text(`Est. Tomorrow: $${nf(estimatedTomorrow, 0, 2)}  (${change >= 0 ? '+' : ''}${nf(changePct, 1, 2)}%)`, 280, 480);
+  text(`Est. Tomorrow: $${nf(estimatedTomorrow, 0, 2)}  (${change >= 0 ? '+' : ''}${nf(changePct, 1, 2)}%)`, 280, 500);
   
   fill(230);
   textSize(13);
-  text(`Last state: ${markov.lastState}   |   σ = ${nf(markov.std * 100, 1, 2)}%`, 40, 510);
+  text(`Last state: ${markov.lastState}   |   σ = ${nf(markov.std * 100, 1, 2)}%`, 40, 530);
   
-  let y = 545;
+  let y = 565;
   textSize(12);
   text('Tomorrow probability distribution (Softmax):', 40, y);
   y += 18;
@@ -160,7 +198,7 @@ function draw() {
     y += 17;
   }
   
-  drawCompactMatrix(420, 545);
+  drawCompactMatrix(420, 565);
 }
 
 function drawPriceChart(x, y, w, h) {
@@ -347,7 +385,6 @@ class MarkovTree {
     this.lastState = this.states[this.states.length - 1];
   }
   
-  // Softmax with temperature
   softmax(scores, temperature = 1.0) {
     let maxScore = Math.max(...scores);
     let exps = scores.map(s => Math.exp((s - maxScore) / temperature));
@@ -357,7 +394,7 @@ class MarkovTree {
   
   getTransitionProb(from, to) {
     let counts = this.transitions[from] || {};
-    let scores = this.allStates.map(s => (counts[s] || 0) + 0.1); // small smoothing
+    let scores = this.allStates.map(s => (counts[s] || 0) + 0.1);
     let probs = this.softmax(scores, TEMPERATURE);
     let idx = this.allStates.indexOf(to);
     return idx >= 0 ? probs[idx] : 0;
@@ -368,10 +405,7 @@ class MarkovTree {
     let counts = this.transitions[from] || {};
     let currentPrice = this.prices[this.prices.length - 1];
     
-    // Raw scores with smoothing
     let scores = this.allStates.map(s => (counts[s] || 0) + 0.1);
-    
-    // Softmax probabilities
     let probs = this.softmax(scores, TEMPERATURE);
     
     let result = [];
