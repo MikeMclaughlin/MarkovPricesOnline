@@ -1,534 +1,415 @@
+// =====================================================
+// Coding Markov - Stock Markov Chain Analyzer (p5.js)
+// =====================================================
+
+let symbolInput, loadBtn, statusText;
 let closes = [];
-let markov;
-let tomorrowProbs = [];
+let dates = [];
 let returns = [];
+let states = [];
 let rsiValues = [];
-let estimatedTomorrow = 0;
+let transitionMatrix = Array(7).fill().map(() => Array(7).fill(0));
+let transitionProbs = Array(7).fill().map(() => Array(7).fill(0));
+let currentState = 3; // default flat
+let nextDayProbs = Array(7).fill(0);
+let expectedNextClose = 0;
+let meanReturn = 0;
+let stdReturn = 0;
 
-let symbolInput;
-let loadButton;
-let currentSymbol = 'SNDK';
-
-// Divergence results
-let bullishDivergence = false;
-let bearishDivergence = false;
-let divInfo = '';
-
-const LOOKBACK = 252;
-const RSI_PERIOD = 14;
-const DIV_LOOKBACK = 40;
-const PIVOT_WINDOW = 5;
+const STATE_LABELS = ["-3σ", "-2σ", "-1σ", "Flat", "+1σ", "+2σ", "+3σ"];
+const LOOKBACK = 252; // trading days
 
 function setup() {
-  createCanvas(1100, 1000);
-  textFont('monospace');
-  
-  symbolInput = createInput(currentSymbol);
-  symbolInput.position(40, 20);
+  createCanvas(1100, 920);
+  textFont("monospace");
+
+  // UI
+  symbolInput = createInput("SNDK");
+  symbolInput.position(20, 20);
   symbolInput.size(120);
-  
-  loadButton = createButton('Load');
-  loadButton.position(175, 20);
-  loadButton.mousePressed(loadNewSymbol);
-  
-  loadNewSymbol();
+
+  loadBtn = createButton("Load");
+  loadBtn.position(150, 20);
+  loadBtn.mousePressed(loadStock);
+
+  statusText = createP("Enter a symbol and click Load");
+  statusText.position(220, 12);
+  statusText.style("color", "#aaa");
+  statusText.style("font-family", "monospace");
 }
 
-async function loadNewSymbol() {
-  currentSymbol = symbolInput.value().trim().toUpperCase() || 'SNDK';
-  
-  closes = [];
-  returns = [];
-  rsiValues = [];
-  tomorrowProbs = [];
-  estimatedTomorrow = 0;
-  markov = null;
-  bullishDivergence = false;
-  bearishDivergence = false;
-  divInfo = '';
-  
-  background(18);
-  fill(200);
-  textSize(16);
-  text(`Loading ${currentSymbol}...`, 40, 100);
-  
-  closes = await loadStockCloses(currentSymbol, LOOKBACK);
-  
-  if (closes.length < 50) {
-    background(18);
-    fill(255, 80, 80);
-    textSize(16);
-    text(`Failed to load enough data for ${currentSymbol}`, 40, 100);
+function draw() {
+  background(18, 18, 24);
+
+  // Header
+  fill(220);
+  textSize(18);
+  text("Coding Markov — 7-State Stock Markov Chain", 20, 70);
+
+  if (closes.length === 0) {
+    fill(160);
+    textSize(14);
+    text("Waiting for data...", 20, 120);
     return;
   }
-  
+
+  // ========== PRICE CHART ==========
+  drawPriceChart(20, 90, 640, 220);
+
+  // ========== RSI CHART ==========
+  drawRSIChart(20, 340, 640, 160);
+
+  // ========== TRANSITION MATRIX ==========
+  drawTransitionMatrix(680, 90);
+
+  // ========== NEXT DAY PROBABILITIES ==========
+  drawNextDayProbs(680, 340);
+
+  // ========== EXPECTED PRICE ==========
+  drawExpectedPrice(680, 560);
+}
+
+// -----------------------------------------------------
+// DATA LOADING
+// -----------------------------------------------------
+async function loadStock() {
+  const symbol = symbolInput.value().trim().toUpperCase();
+  if (!symbol) return;
+
+  statusText.html(`Loading ${symbol}...`);
+  statusText.style("color", "#f0c040");
+
+  try {
+    // Using corsproxy to avoid CORS issues with Yahoo Finance
+    const url = `https://corsproxy.io/?https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1d&range=3y`;
+    const res = await fetch(url);
+    const data = await res.json();
+
+    const result = data.chart.result[0];
+    const timestamps = result.timestamp;
+    const quote = result.indicators.quote[0];
+    const closeArr = quote.close;
+
+    // Clean data
+    closes = [];
+    dates = [];
+    for (let i = 0; i < closeArr.length; i++) {
+      if (closeArr[i] != null) {
+        closes.push(closeArr[i]);
+        dates.push(new Date(timestamps[i] * 1000));
+      }
+    }
+
+    // Keep last 252 trading days
+    if (closes.length > LOOKBACK) {
+      closes = closes.slice(-LOOKBACK);
+      dates = dates.slice(-LOOKBACK);
+    }
+
+    processData();
+    statusText.html(`Loaded ${symbol} • ${closes.length} days`);
+    statusText.style("color", "#4caf50");
+  } catch (err) {
+    console.error(err);
+    statusText.html("Error loading data. Try again.");
+    statusText.style("color", "#f44336");
+  }
+}
+
+// -----------------------------------------------------
+// PROCESSING
+// -----------------------------------------------------
+function processData() {
+  // Daily returns
   returns = [];
   for (let i = 1; i < closes.length; i++) {
     returns.push((closes[i] - closes[i - 1]) / closes[i - 1]);
   }
-  
-  rsiValues = calculateRSI(closes, RSI_PERIOD);
-  
-  detectRSIDivergence();
-  
-  markov = new MarkovTree(closes);
-  tomorrowProbs = markov.predictTomorrow();
-  
-  estimatedTomorrow = 0;
-  for (let p of tomorrowProbs) {
-    estimatedTomorrow += p.prob * p.estimatedPrice;
+
+  // Mean & Std of returns
+  meanReturn = returns.reduce((a, b) => a + b, 0) / returns.length;
+  const variance = returns.reduce((a, b) => a + Math.pow(b - meanReturn, 2), 0) / returns.length;
+  stdReturn = Math.sqrt(variance);
+
+  // Assign states (-3σ ... +3σ)
+  states = returns.map(r => {
+    const z = (r - meanReturn) / stdReturn;
+    if (z <= -2.5) return 0;
+    if (z <= -1.5) return 1;
+    if (z <= -0.5) return 2;
+    if (z < 0.5) return 3;
+    if (z < 1.5) return 4;
+    if (z < 2.5) return 5;
+    return 6;
+  });
+
+  // Build transition matrix (counts)
+  transitionMatrix = Array(7).fill().map(() => Array(7).fill(0));
+  for (let i = 0; i < states.length - 1; i++) {
+    transitionMatrix[states[i]][states[i + 1]]++;
   }
-  
-  redraw();
+
+  // Convert to probabilities (empirical)
+  transitionProbs = transitionMatrix.map(row => {
+    const total = row.reduce((a, b) => a + b, 0);
+    return total === 0 ? Array(7).fill(0) : row.map(c => c / total);
+  });
+
+  // Current state = last observed
+  currentState = states[states.length - 1];
+  nextDayProbs = transitionProbs[currentState];
+
+  // Expected next return & price
+  const expectedReturn = nextDayProbs.reduce((sum, p, i) => {
+    // approximate center of each bucket
+    const centers = [-3, -2, -1, 0, 1, 2, 3];
+    return sum + p * (meanReturn + centers[i] * stdReturn);
+  }, 0);
+
+  expectedNextClose = closes[closes.length - 1] * (1 + expectedReturn);
+
+  // RSI
+  calculateRSI();
 }
 
-async function loadStockCloses(symbol, lookback) {
-  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?range=2y&interval=1d`;
-  
-  try {
-    const response = await fetch(url);
-    if (!response.ok) throw new Error('Network response was not ok');
-    const json = await response.json();
-    const result = json.chart.result[0];
-    const rawCloses = result.indicators.quote[0].close;
-    
-    let prices = rawCloses.filter(c => c != null);
-    if (prices.length > lookback) prices = prices.slice(-lookback);
-    console.log(`Loaded ${prices.length} closes for ${symbol}`);
-    return prices;
-  } catch (err) {
-    console.error('Direct fetch failed, trying proxy...', err);
-    try {
-      const proxyUrl = 'https://api.allorigins.win/raw?url=' + encodeURIComponent(url);
-      const response = await fetch(proxyUrl);
-      const json = await response.json();
-      const rawCloses = json.chart.result[0].indicators.quote[0].close;
-      let prices = rawCloses.filter(c => c != null);
-      if (prices.length > lookback) prices = prices.slice(-lookback);
-      return prices;
-    } catch (err2) {
-      console.error('Proxy also failed:', err2);
-      return [];
-    }
-  }
-}
+// -----------------------------------------------------
+// RSI (14) + Adaptive levels
+// -----------------------------------------------------
+function calculateRSI() {
+  const period = 14;
+  rsiValues = Array(closes.length).fill(null);
 
-function calculateRSI(prices, period = 14) {
-  let rsi = new Array(prices.length).fill(null);
-  if (prices.length < period + 1) return rsi;
-  
   let gains = 0;
   let losses = 0;
-  
+
   for (let i = 1; i <= period; i++) {
-    let change = prices[i] - prices[i - 1];
+    const change = closes[i] - closes[i - 1];
     if (change >= 0) gains += change;
     else losses -= change;
   }
-  
+
   let avgGain = gains / period;
   let avgLoss = losses / period;
-  
-  rsi[period] = avgLoss === 0 ? 100 : 100 - (100 / (1 + avgGain / avgLoss));
-  
-  for (let i = period + 1; i < prices.length; i++) {
-    let change = prices[i] - prices[i - 1];
-    let gain = change > 0 ? change : 0;
-    let loss = change < 0 ? -change : 0;
-    
+
+  rsiValues[period] = 100 - (100 / (1 + avgGain / (avgLoss || 1e-10)));
+
+  for (let i = period + 1; i < closes.length; i++) {
+    const change = closes[i] - closes[i - 1];
+    const gain = change > 0 ? change : 0;
+    const loss = change < 0 ? -change : 0;
+
     avgGain = (avgGain * (period - 1) + gain) / period;
     avgLoss = (avgLoss * (period - 1) + loss) / period;
-    
-    rsi[i] = avgLoss === 0 ? 100 : 100 - (100 / (1 + avgGain / avgLoss));
-  }
-  
-  return rsi;
-}
 
-function percentile(arr, p) {
-  let sorted = arr.slice().sort((a, b) => a - b);
-  let index = (p / 100) * (sorted.length - 1);
-  let lower = Math.floor(index);
-  let upper = Math.ceil(index);
-  if (lower === upper) return sorted[lower];
-  return sorted[lower] + (sorted[upper] - sorted[lower]) * (index - lower);
-}
-
-function detectRSIDivergence() {
-  bullishDivergence = false;
-  bearishDivergence = false;
-  divInfo = '';
-  
-  let n = closes.length;
-  if (n < DIV_LOOKBACK + 10) return;
-  
-  let priceLows = [];
-  let priceHighs = [];
-  let rsiLows = [];
-  let rsiHighs = [];
-  
-  let start = Math.max(RSI_PERIOD + PIVOT_WINDOW, n - DIV_LOOKBACK);
-  
-  for (let i = start; i < n - PIVOT_WINDOW; i++) {
-    let isPriceLow = true;
-    for (let k = 1; k <= PIVOT_WINDOW; k++) {
-      if (closes[i] > closes[i - k] || closes[i] > closes[i + k]) {
-        isPriceLow = false;
-        break;
-      }
-    }
-    if (isPriceLow) priceLows.push({ idx: i, val: closes[i] });
-    
-    let isPriceHigh = true;
-    for (let k = 1; k <= PIVOT_WINDOW; k++) {
-      if (closes[i] < closes[i - k] || closes[i] < closes[i + k]) {
-        isPriceHigh = false;
-        break;
-      }
-    }
-    if (isPriceHigh) priceHighs.push({ idx: i, val: closes[i] });
-    
-    if (rsiValues[i] != null) {
-      let isRsiLow = true;
-      for (let k = 1; k <= PIVOT_WINDOW; k++) {
-        if (rsiValues[i] > rsiValues[i - k] || rsiValues[i] > rsiValues[i + k]) {
-          isRsiLow = false;
-          break;
-        }
-      }
-      if (isRsiLow) rsiLows.push({ idx: i, val: rsiValues[i] });
-      
-      let isRsiHigh = true;
-      for (let k = 1; k <= PIVOT_WINDOW; k++) {
-        if (rsiValues[i] < rsiValues[i - k] || rsiValues[i] < rsiValues[i + k]) {
-          isRsiHigh = false;
-          break;
-        }
-      }
-      if (isRsiHigh) rsiHighs.push({ idx: i, val: rsiValues[i] });
-    }
-  }
-  
-  // Bullish divergence
-  if (priceLows.length >= 2 && rsiLows.length >= 2) {
-    let p1 = priceLows[priceLows.length - 2];
-    let p2 = priceLows[priceLows.length - 1];
-    let r1 = rsiLows[rsiLows.length - 2];
-    let r2 = rsiLows[rsiLows.length - 1];
-    
-    if (Math.abs(p2.idx - r2.idx) < 8 && Math.abs(p1.idx - r1.idx) < 8) {
-      if (p2.val < p1.val && r2.val > r1.val) {
-        bullishDivergence = true;
-        divInfo = `Bullish divergence (price LL + RSI HL)`;
-      }
-    }
-  }
-  
-  // Bearish divergence
-  if (priceHighs.length >= 2 && rsiHighs.length >= 2) {
-    let p1 = priceHighs[priceHighs.length - 2];
-    let p2 = priceHighs[priceHighs.length - 1];
-    let r1 = rsiHighs[rsiHighs.length - 2];
-    let r2 = rsiHighs[rsiHighs.length - 1];
-    
-    if (Math.abs(p2.idx - r2.idx) < 8 && Math.abs(p1.idx - r1.idx) < 8) {
-      if (p2.val > p1.val && r2.val < r1.val) {
-        bearishDivergence = true;
-        divInfo = `Bearish divergence (price HH + RSI LH)`;
-      }
-    }
+    rsiValues[i] = 100 - (100 / (1 + avgGain / (avgLoss || 1e-10)));
   }
 }
 
-function draw() {
-  background(18);
-  
-  fill(230);
-  textSize(18);
-  text(`${currentSymbol} – Price + RSI + Markov + Divergence`, 40, 70);
-  textSize(12);
-  text(`Last ${closes.length} trading days  |  RSI period: ${RSI_PERIOD}`, 40, 90);
-  
-  if (closes.length === 0 || !markov) return;
-  
-  drawPriceChart(40, 110, width - 80, 200);
-  drawRSIChart(40, 335, width - 80, 130);
-  
-  if (bullishDivergence || bearishDivergence) {
-    if (bullishDivergence) fill(80, 255, 120);
-    else fill(255, 100, 100);
-    textSize(14);
-    text(`⚠ ${divInfo}`, 40, 485);
-  }
-  
-  let todayClose = closes[closes.length - 1];
-  let change = estimatedTomorrow - todayClose;
-  let changePct = (change / todayClose) * 100;
-  
-  fill(230);
-  textSize(14);
-  text(`Today: $${nf(todayClose, 0, 2)}`, 40, 515);
-  
-  if (change >= 0) fill(80, 220, 120);
-  else fill(255, 100, 100);
-  text(`Est. Tomorrow: $${nf(estimatedTomorrow, 0, 2)}  (${change >= 0 ? '+' : ''}${nf(changePct, 1, 2)}%)`, 280, 515);
-  
-  fill(230);
-  textSize(13);
-  text(`Last state: ${markov.lastState}   |   σ = ${nf(markov.std * 100, 1, 2)}%`, 40, 545);
-  
-  let y = 580;
-  textSize(12);
-  text('Tomorrow probability distribution:', 40, y);
-  y += 18;
-  
-  for (let p of tomorrowProbs) {
-    fill(70, 140, 255, 160);
-    rect(40, y - 10, p.prob * 200, 14);
-    fill(230);
-    text(`${p.state.padEnd(5)} ${nf(p.prob * 100, 2, 1)}%  → $${nf(p.estimatedPrice, 0, 2)}`, 40, y);
-    y += 17;
-  }
-  
-  drawCompactMatrix(420, 580);
+// Adaptive overbought / oversold (10th & 90th percentile)
+function getAdaptiveRSILevels() {
+  const valid = rsiValues.filter(v => v != null);
+  if (valid.length < 20) return { oversold: 30, overbought: 70 };
+
+  const sorted = [...valid].sort((a, b) => a - b);
+  const p10 = sorted[Math.floor(sorted.length * 0.10)];
+  const p90 = sorted[Math.floor(sorted.length * 0.90)];
+  return { oversold: p10, overbought: p90 };
 }
 
+// -----------------------------------------------------
+// DRAWING FUNCTIONS
+// -----------------------------------------------------
 function drawPriceChart(x, y, w, h) {
-  fill(25);
+  // Background
+  fill(28, 28, 36);
   noStroke();
   rect(x, y, w, h, 6);
-  
-  fill(180);
-  textSize(12);
-  textAlign(LEFT);
-  text('Closing Price', x + 8, y + 16);
-  
-  let minP = Math.min(...closes);
-  let maxP = Math.max(...closes);
-  let pad = (maxP - minP) * 0.05;
-  minP -= pad;
-  maxP += pad;
-  
+
+  fill(200);
+  textSize(13);
+  text("Closing Price", x + 10, y + 18);
+
+  if (closes.length < 2) return;
+
+  const minP = Math.min(...closes);
+  const maxP = Math.max(...closes);
+  const range = maxP - minP || 1;
+
+  // Price line
   noFill();
-  stroke(80, 180, 255);
-  strokeWeight(1.8);
+  stroke(0, 180, 255);
+  strokeWeight(1.5);
   beginShape();
   for (let i = 0; i < closes.length; i++) {
-    let px = map(i, 0, closes.length - 1, x + 10, x + w - 10);
-    let py = map(closes[i], minP, maxP, y + h - 12, y + 25);
+    const px = map(i, 0, closes.length - 1, x + 10, x + w - 10);
+    const py = map(closes[i], minP, maxP, y + h - 20, y + 30);
     vertex(px, py);
   }
   endShape();
-  
-  if (bullishDivergence) {
-    fill(80, 255, 120);
-    noStroke();
-    textSize(14);
-    text('▲ Bullish Div', x + w - 130, y + h - 15);
-  }
-  if (bearishDivergence) {
-    fill(255, 100, 100);
-    noStroke();
-    textSize(14);
-    text('▼ Bearish Div', x + w - 130, y + 30);
-  }
-  
-  fill(80, 180, 255);
+
+  // Today label
+  fill(255);
   noStroke();
-  textAlign(RIGHT);
-  text('$' + nf(closes[closes.length-1], 0, 2), x + w - 10, y + 16);
-  textAlign(LEFT);
+  textSize(12);
+  text(`Today: $${closes[closes.length - 1].toFixed(2)}`, x + 10, y + h - 8);
 }
 
 function drawRSIChart(x, y, w, h) {
-  fill(25);
+  fill(28, 28, 36);
   noStroke();
   rect(x, y, w, h, 6);
-  
-  let validRSI = rsiValues.filter(v => v != null);
-  let oversold   = percentile(validRSI, 10);
-  let overbought = percentile(validRSI, 90);
-  
-  fill(180);
-  textSize(12);
-  text(`RSI (${RSI_PERIOD})  |  Adaptive: ${nf(oversold,1,1)} / ${nf(overbought,1,1)}`, x + 8, y + 16);
-  
-  noStroke();
-  let yOB = map(overbought, 0, 100, y + h - 12, y + 25);
-  let yOS = map(oversold, 0, 100, y + h - 12, y + 25);
-  
-  fill(255, 60, 60, 35);
-  rect(x + 10, y + 25, w - 20, yOB - (y + 25));
-  
-  fill(60, 200, 80, 30);
-  rect(x + 10, yOS, w - 20, (y + h - 12) - yOS);
-  
-  stroke(180, 80, 80);
-  strokeWeight(1);
-  line(x + 10, yOB, x + w - 10, yOB);
-  
-  stroke(80, 180, 80);
-  line(x + 10, yOS, x + w - 10, yOS);
-  
-  stroke(90);
-  strokeWeight(0.7);
-  let y50 = map(50, 0, 100, y + h - 12, y + 25);
-  line(x + 10, y50, x + w - 10, y50);
-  
+
+  fill(200);
+  textSize(13);
+  text("RSI(14) — Adaptive Levels", x + 10, y + 18);
+
+  const levels = getAdaptiveRSILevels();
+  const validRSI = rsiValues.filter(v => v != null);
+  if (validRSI.length < 5) return;
+
+  // Overbought / Oversold bands
+  const yOB = map(levels.overbought, 0, 100, y + h - 15, y + 30);
+  const yOS = map(levels.oversold, 0, 100, y + h - 15, y + 30);
+
+  fill(255, 80, 80, 40);
+  rect(x + 10, y + 30, w - 20, yOB - (y + 30));
+  fill(80, 255, 120, 40);
+  rect(x + 10, yOS, w - 20, (y + h - 15) - yOS);
+
+  // RSI line
   noFill();
-  stroke(200, 120, 255);
-  strokeWeight(1.7);
+  stroke(255, 180, 50);
+  strokeWeight(1.5);
   beginShape();
   for (let i = 0; i < rsiValues.length; i++) {
     if (rsiValues[i] == null) continue;
-    let px = map(i, 0, rsiValues.length - 1, x + 10, x + w - 10);
-    let py = map(rsiValues[i], 0, 100, y + h - 12, y + 25);
+    const px = map(i, 0, closes.length - 1, x + 10, x + w - 10);
+    const py = map(rsiValues[i], 0, 100, y + h - 15, y + 30);
     vertex(px, py);
   }
   endShape();
-  
-  if (bullishDivergence) {
-    fill(80, 255, 120);
-    noStroke();
-    textSize(13);
-    text('▲ Bullish', x + w - 100, y + h - 15);
-  }
-  if (bearishDivergence) {
-    fill(255, 100, 100);
-    noStroke();
-    textSize(13);
-    text('▼ Bearish', x + w - 100, y + 30);
-  }
-  
-  let lastRSI = rsiValues[rsiValues.length - 1];
-  if (lastRSI != null) {
-    fill(200, 120, 255);
-    noStroke();
-    textAlign(RIGHT);
-    text(nf(lastRSI, 1, 1), x + w - 10, y + 16);
-    textAlign(LEFT);
-  }
-}
 
-function drawCompactMatrix(x, y) {
-  const states = markov.allStates;
-  const cell = 40;
-  
-  fill(180);
+  // Labels
+  fill(200);
+  noStroke();
   textSize(11);
-  text('Transition Matrix', x, y - 6);
-  
-  for (let r = 0; r < 7; r++) {
-    for (let c = 0; c < 7; c++) {
-      let prob = markov.getTransitionProb(states[r], states[c]);
-      let intensity = map(prob, 0, 1, 20, 200);
-      
-      fill(30, 70, intensity);
-      stroke(50);
-      strokeWeight(0.5);
-      rect(x + c * cell, y + r * cell, cell - 1, cell - 1);
-      
-      if (states[r] === markov.lastState) {
-        noFill();
-        stroke(255, 220, 80);
-        strokeWeight(1.5);
-        rect(x + c * cell, y + r * cell, cell - 1, cell - 1);
-      }
-      
-      noStroke();
-      fill(240);
-      textAlign(CENTER, CENTER);
-      textSize(9);
-      text(nf(prob * 100, 0, 0), x + c * cell + cell/2, y + r * cell + cell/2);
-    }
-  }
-  textAlign(LEFT);
+  text(`OB ${levels.overbought.toFixed(0)}`, x + w - 70, yOB - 4);
+  text(`OS ${levels.oversold.toFixed(0)}`, x + w - 70, yOS + 12);
+
+  // Simple divergence markers (last 30 bars)
+  detectAndDrawDivergence(x, y, w, h);
 }
 
-class MarkovTree {
-  constructor(prices) {
-    this.prices = prices;
-    this.allStates = ['-3σ', '-2σ', '-1σ', 'flat', '+1σ', '+2σ', '+3σ'];
-    this.states = [];
-    this.transitions = {};
-    this.stateReturns = {};
-    this.lastState = null;
-    this.mean = 0;
-    this.std = 0;
-    this._build();
-  }
-  
-  _toState(z) {
-    if (z < -2.5) return '-3σ';
-    if (z < -1.5) return '-2σ';
-    if (z < -0.5) return '-1σ';
-    if (z <  0.5) return 'flat';
-    if (z <  1.5) return '+1σ';
-    if (z <  2.5) return '+2σ';
-    return '+3σ';
-  }
-  
-  _build() {
-    let rets = [];
-    for (let i = 1; i < this.prices.length; i++) {
-      rets.push((this.prices[i] - this.prices[i - 1]) / this.prices[i - 1]);
+function detectAndDrawDivergence(x, y, w, h) {
+  // Very simplified divergence detection on last 40 bars
+  const look = 40;
+  const start = Math.max(14, closes.length - look);
+
+  // Find recent swing lows/highs (crude)
+  let lastPriceLow = null;
+  let lastRSILow = null;
+  let lastPriceHigh = null;
+  let lastRSIHigh = null;
+
+  for (let i = start; i < closes.length - 2; i++) {
+    // local low
+    if (closes[i] < closes[i - 1] && closes[i] < closes[i + 1]) {
+      if (lastPriceLow !== null && closes[i] < lastPriceLow && rsiValues[i] > lastRSILow) {
+        // Bullish divergence
+        const px = map(i, 0, closes.length - 1, x + 10, x + w - 10);
+        fill(0, 255, 120);
+        noStroke();
+        textSize(11);
+        text("Bull Div", px - 20, y + h - 25);
+      }
+      lastPriceLow = closes[i];
+      lastRSILow = rsiValues[i];
     }
-    
-    this.mean = rets.reduce((a, b) => a + b, 0) / rets.length;
-    let variance = rets.reduce((a, b) => a + (b - this.mean) ** 2, 0) / rets.length;
-    this.std = Math.sqrt(variance) || 0.0001;
-    
-    for (let ret of rets) {
-      let z = (ret - this.mean) / this.std;
-      let state = this._toState(z);
-      this.states.push(state);
-      
-      if (!this.stateReturns[state]) this.stateReturns[state] = [];
-      this.stateReturns[state].push(ret);
+    // local high
+    if (closes[i] > closes[i - 1] && closes[i] > closes[i + 1]) {
+      if (lastPriceHigh !== null && closes[i] > lastPriceHigh && rsiValues[i] < lastRSIHigh) {
+        // Bearish divergence
+        const px = map(i, 0, closes.length - 1, x + 10, x + w - 10);
+        fill(255, 80, 80);
+        noStroke();
+        textSize(11);
+        text("Bear Div", px - 20, y + 45);
+      }
+      lastPriceHigh = closes[i];
+      lastRSIHigh = rsiValues[i];
     }
-    
-    for (let s in this.stateReturns) {
-      let arr = this.stateReturns[s];
-      this.stateReturns[s] = arr.reduce((a, b) => a + b, 0) / arr.length;
-    }
-    
-    for (let i = 0; i < this.states.length - 1; i++) {
-      let from = this.states[i];
-      let to   = this.states[i + 1];
-      if (!this.transitions[from]) this.transitions[from] = {};
-      if (!this.transitions[from][to]) this.transitions[from][to] = 0;
-      this.transitions[from][to]++;
-    }
-    
-    this.lastState = this.states[this.states.length - 1];
   }
-  
-  getTransitionProb(from, to) {
-    let counts = this.transitions[from] || {};
-    let total = Object.values(counts).reduce((a, b) => a + b, 0);
-    if (total === 0) return 0;
-    return (counts[to] || 0) / total;
+}
+
+function drawTransitionMatrix(x, y) {
+  fill(28, 28, 36);
+  noStroke();
+  rect(x, y, 390, 230, 6);
+
+  fill(200);
+  textSize(13);
+  text("Transition Matrix (empirical)", x + 10, y + 20);
+
+  textSize(11);
+  // Header
+  for (let j = 0; j < 7; j++) {
+    fill(180);
+    text(STATE_LABELS[j], x + 55 + j * 46, y + 42);
   }
-  
-  predictTomorrow() {
-    let from = this.lastState;
-    let counts = this.transitions[from] || {};
-    let total = Object.values(counts).reduce((a, b) => a + b, 0);
-    let currentPrice = this.prices[this.prices.length - 1];
-    let result = [];
-    
-    for (let s of this.allStates) {
-      let prob = total === 0 ? 1 / this.allStates.length : (counts[s] || 0) / total;
-      let avgRet = this.stateReturns[s] || 0;
-      
-      result.push({
-        state: s,
-        prob: prob,
-        estimatedPrice: currentPrice * (1 + avgRet)
-      });
+
+  for (let i = 0; i < 7; i++) {
+    fill(180);
+    text(STATE_LABELS[i], x + 10, y + 62 + i * 22);
+
+    for (let j = 0; j < 7; j++) {
+      const p = transitionProbs[i][j];
+      const bright = map(p, 0, 0.5, 40, 220);
+      fill(bright, bright * 0.8, 40);
+      text(p.toFixed(2), x + 55 + j * 46, y + 62 + i * 22);
     }
-    
-    result.sort((a, b) => b.prob - a.prob);
-    return result;
   }
+}
+
+function drawNextDayProbs(x, y) {
+  fill(28, 28, 36);
+  noStroke();
+  rect(x, y, 390, 200, 6);
+
+  fill(200);
+  textSize(13);
+  text(`Next-Day Probabilities  (from ${STATE_LABELS[currentState]})`, x + 10, y + 20);
+
+  const maxP = Math.max(...nextDayProbs, 0.01);
+
+  for (let i = 0; i < 7; i++) {
+    const barW = map(nextDayProbs[i], 0, maxP, 0, 220);
+    fill(i < 3 ? color(255, 90, 90) : i > 3 ? color(80, 220, 120) : color(180));
+    rect(x + 90, y + 40 + i * 22, barW, 16, 3);
+
+    fill(220);
+    textSize(12);
+    text(STATE_LABELS[i], x + 12, y + 52 + i * 22);
+    text((nextDayProbs[i] * 100).toFixed(1) + "%", x + 320, y + 52 + i * 22);
+  }
+}
+
+function drawExpectedPrice(x, y) {
+  fill(28, 28, 36);
+  noStroke();
+  rect(x, y, 390, 100, 6);
+
+  fill(200);
+  textSize(13);
+  text("Probability-Weighted Estimate", x + 10, y + 22);
+
+  const today = closes[closes.length - 1];
+  const change = expectedNextClose - today;
+  const pct = (change / today) * 100;
+
+  textSize(16);
+  fill(220);
+  text(`Today:   $${today.toFixed(2)}`, x + 15, y + 55);
+
+  fill(change >= 0 ? color(80, 220, 120) : color(255, 90, 90));
+  text(`Tomorrow est: $${expectedNextClose.toFixed(2)}  (${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%)`, x + 15, y + 80);
 }
