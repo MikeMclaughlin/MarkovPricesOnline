@@ -3,10 +3,12 @@ let markov;
 let tomorrowProbs = [];
 let returns = [];
 let rsiValues = [];
+let estimatedTomorrow = 0;
 
 const SYMBOL = 'SNDK';
 const LOOKBACK = 252;
 const RSI_PERIOD = 14;
+const TEMPERATURE = 1.0;   // 0.5 = sharper, 1.0 = normal, 1.5–2.5 = smoother
 
 async function setup() {
   createCanvas(1100, 980);
@@ -22,7 +24,7 @@ async function setup() {
     return;
   }
   
-  // Daily returns (still needed for Markov)
+  // Daily returns
   for (let i = 1; i < closes.length; i++) {
     returns.push((closes[i] - closes[i - 1]) / closes[i - 1]);
   }
@@ -32,6 +34,12 @@ async function setup() {
   
   markov = new MarkovTree(closes);
   tomorrowProbs = markov.predictTomorrow();
+  
+  // Probability-weighted estimate of tomorrow's closing price
+  estimatedTomorrow = 0;
+  for (let p of tomorrowProbs) {
+    estimatedTomorrow += p.prob * p.estimatedPrice;
+  }
   
   noLoop();
 }
@@ -112,7 +120,7 @@ function draw() {
   background(18);
   fill(230);
   textSize(18);
-  text(`${SYMBOL} – Price + RSI + Markov`, 20, 28);
+  text(`${SYMBOL} – Price + RSI + Markov (Softmax T=${TEMPERATURE})`, 20, 28);
   textSize(12);
   text(`Last ${closes.length} trading days  |  RSI period: ${RSI_PERIOD}`, 20, 48);
   
@@ -121,13 +129,27 @@ function draw() {
   drawPriceChart(40, 65, width - 80, 220);
   drawRSIChart(40, 310, width - 80, 140);
   
+  // Today's price + estimated tomorrow price
+  let todayClose = closes[closes.length - 1];
+  let change = estimatedTomorrow - todayClose;
+  let changePct = (change / todayClose) * 100;
+  
+  fill(230);
+  textSize(14);
+  text(`Today: $${nf(todayClose, 0, 2)}`, 40, 480);
+  
+  if (change >= 0) fill(80, 220, 120);
+  else fill(255, 100, 100);
+  
+  text(`Est. Tomorrow: $${nf(estimatedTomorrow, 0, 2)}  (${change >= 0 ? '+' : ''}${nf(changePct, 1, 2)}%)`, 280, 480);
+  
   fill(230);
   textSize(13);
-  text(`Current close: $${nf(closes[closes.length-1], 0, 2)}   |   Last state: ${markov.lastState}   |   σ = ${nf(markov.std * 100, 1, 2)}%`, 40, 480);
+  text(`Last state: ${markov.lastState}   |   σ = ${nf(markov.std * 100, 1, 2)}%`, 40, 510);
   
-  let y = 510;
+  let y = 545;
   textSize(12);
-  text('Tomorrow probability distribution:', 40, y);
+  text('Tomorrow probability distribution (Softmax):', 40, y);
   y += 18;
   
   for (let p of tomorrowProbs) {
@@ -138,7 +160,7 @@ function draw() {
     y += 17;
   }
   
-  drawCompactMatrix(420, 510);
+  drawCompactMatrix(420, 545);
 }
 
 function drawPriceChart(x, y, w, h) {
@@ -180,7 +202,6 @@ function drawRSIChart(x, y, w, h) {
   noStroke();
   rect(x, y, w, h, 6);
   
-  // Adaptive levels from the actual RSI history of this stock
   let validRSI = rsiValues.filter(v => v != null);
   let oversold   = percentile(validRSI, 10);
   let overbought = percentile(validRSI, 90);
@@ -189,7 +210,6 @@ function drawRSIChart(x, y, w, h) {
   textSize(12);
   text(`RSI (${RSI_PERIOD})  |  Adaptive: ${nf(oversold,1,1)} / ${nf(overbought,1,1)}`, x + 8, y + 16);
   
-  // Zones
   noStroke();
   let yOB = map(overbought, 0, 100, y + h - 12, y + 25);
   let yOS = map(oversold, 0, 100, y + h - 12, y + 25);
@@ -200,7 +220,6 @@ function drawRSIChart(x, y, w, h) {
   fill(60, 200, 80, 30);
   rect(x + 10, yOS, w - 20, (y + h - 12) - yOS);
   
-  // Lines
   stroke(180, 80, 80);
   strokeWeight(1);
   line(x + 10, yOB, x + w - 10, yOB);
@@ -213,7 +232,6 @@ function drawRSIChart(x, y, w, h) {
   let y50 = map(50, 0, 100, y + h - 12, y + 25);
   line(x + 10, y50, x + w - 10, y50);
   
-  // RSI line
   noFill();
   stroke(200, 120, 255);
   strokeWeight(1.7);
@@ -226,7 +244,6 @@ function drawRSIChart(x, y, w, h) {
   }
   endShape();
   
-  // Current value
   let lastRSI = rsiValues[rsiValues.length - 1];
   if (lastRSI != null) {
     fill(200, 120, 255);
@@ -243,7 +260,7 @@ function drawCompactMatrix(x, y) {
   
   fill(180);
   textSize(11);
-  text('Transition Matrix', x, y - 6);
+  text('Transition Matrix (Softmax)', x, y - 6);
   
   for (let r = 0; r < 7; r++) {
     for (let c = 0; c < 7; c++) {
@@ -330,26 +347,41 @@ class MarkovTree {
     this.lastState = this.states[this.states.length - 1];
   }
   
+  // Softmax with temperature
+  softmax(scores, temperature = 1.0) {
+    let maxScore = Math.max(...scores);
+    let exps = scores.map(s => Math.exp((s - maxScore) / temperature));
+    let sum = exps.reduce((a, b) => a + b, 0);
+    return exps.map(e => e / sum);
+  }
+  
   getTransitionProb(from, to) {
     let counts = this.transitions[from] || {};
-    let total = Object.values(counts).reduce((a, b) => a + b, 0);
-    if (total === 0) return 0;
-    return (counts[to] || 0) / total;
+    let scores = this.allStates.map(s => (counts[s] || 0) + 0.1); // small smoothing
+    let probs = this.softmax(scores, TEMPERATURE);
+    let idx = this.allStates.indexOf(to);
+    return idx >= 0 ? probs[idx] : 0;
   }
   
   predictTomorrow() {
     let from = this.lastState;
     let counts = this.transitions[from] || {};
-    let total = Object.values(counts).reduce((a, b) => a + b, 0);
     let currentPrice = this.prices[this.prices.length - 1];
-    let result = [];
     
-    for (let s of this.allStates) {
-      let prob = total === 0 ? 1 / 7 : (counts[s] || 0) / total;
+    // Raw scores with smoothing
+    let scores = this.allStates.map(s => (counts[s] || 0) + 0.1);
+    
+    // Softmax probabilities
+    let probs = this.softmax(scores, TEMPERATURE);
+    
+    let result = [];
+    for (let i = 0; i < this.allStates.length; i++) {
+      let s = this.allStates[i];
       let avgRet = this.stateReturns[s] || 0;
+      
       result.push({
         state: s,
-        prob: prob,
+        prob: probs[i],
         estimatedPrice: currentPrice * (1 + avgRet)
       });
     }
