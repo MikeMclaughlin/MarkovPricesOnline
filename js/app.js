@@ -9,40 +9,44 @@ let symbolInput;
 let loadButton;
 let currentSymbol = 'SNDK';
 
+// Divergence results
+let bullishDivergence = false;
+let bearishDivergence = false;
+let divInfo = '';
+
 const LOOKBACK = 252;
 const RSI_PERIOD = 14;
-const TEMPERATURE = 1.0;
+const DIV_LOOKBACK = 40;
+const PIVOT_WINDOW = 5;
 
 function setup() {
-  createCanvas(1100, 980);
+  createCanvas(1100, 1000);
   textFont('monospace');
   
-  // --- UI Controls ---
   symbolInput = createInput(currentSymbol);
   symbolInput.position(40, 20);
   symbolInput.size(120);
-  symbolInput.attribute('placeholder', 'Symbol');
   
   loadButton = createButton('Load');
   loadButton.position(175, 20);
   loadButton.mousePressed(loadNewSymbol);
   
-  // Initial load
   loadNewSymbol();
 }
 
 async function loadNewSymbol() {
   currentSymbol = symbolInput.value().trim().toUpperCase() || 'SNDK';
   
-  // Clear previous data
   closes = [];
   returns = [];
   rsiValues = [];
   tomorrowProbs = [];
   estimatedTomorrow = 0;
   markov = null;
+  bullishDivergence = false;
+  bearishDivergence = false;
+  divInfo = '';
   
-  // Show loading message
   background(18);
   fill(200);
   textSize(16);
@@ -50,7 +54,7 @@ async function loadNewSymbol() {
   
   closes = await loadStockCloses(currentSymbol, LOOKBACK);
   
-  if (closes.length < 30) {
+  if (closes.length < 50) {
     background(18);
     fill(255, 80, 80);
     textSize(16);
@@ -58,20 +62,18 @@ async function loadNewSymbol() {
     return;
   }
   
-  // Daily returns
   returns = [];
   for (let i = 1; i < closes.length; i++) {
     returns.push((closes[i] - closes[i - 1]) / closes[i - 1]);
   }
   
-  // RSI
   rsiValues = calculateRSI(closes, RSI_PERIOD);
   
-  // Markov model
+  detectRSIDivergence();
+  
   markov = new MarkovTree(closes);
   tomorrowProbs = markov.predictTomorrow();
   
-  // Probability-weighted estimate
   estimatedTomorrow = 0;
   for (let p of tomorrowProbs) {
     estimatedTomorrow += p.prob * p.estimatedPrice;
@@ -152,13 +154,98 @@ function percentile(arr, p) {
   return sorted[lower] + (sorted[upper] - sorted[lower]) * (index - lower);
 }
 
+function detectRSIDivergence() {
+  bullishDivergence = false;
+  bearishDivergence = false;
+  divInfo = '';
+  
+  let n = closes.length;
+  if (n < DIV_LOOKBACK + 10) return;
+  
+  let priceLows = [];
+  let priceHighs = [];
+  let rsiLows = [];
+  let rsiHighs = [];
+  
+  let start = Math.max(RSI_PERIOD + PIVOT_WINDOW, n - DIV_LOOKBACK);
+  
+  for (let i = start; i < n - PIVOT_WINDOW; i++) {
+    let isPriceLow = true;
+    for (let k = 1; k <= PIVOT_WINDOW; k++) {
+      if (closes[i] > closes[i - k] || closes[i] > closes[i + k]) {
+        isPriceLow = false;
+        break;
+      }
+    }
+    if (isPriceLow) priceLows.push({ idx: i, val: closes[i] });
+    
+    let isPriceHigh = true;
+    for (let k = 1; k <= PIVOT_WINDOW; k++) {
+      if (closes[i] < closes[i - k] || closes[i] < closes[i + k]) {
+        isPriceHigh = false;
+        break;
+      }
+    }
+    if (isPriceHigh) priceHighs.push({ idx: i, val: closes[i] });
+    
+    if (rsiValues[i] != null) {
+      let isRsiLow = true;
+      for (let k = 1; k <= PIVOT_WINDOW; k++) {
+        if (rsiValues[i] > rsiValues[i - k] || rsiValues[i] > rsiValues[i + k]) {
+          isRsiLow = false;
+          break;
+        }
+      }
+      if (isRsiLow) rsiLows.push({ idx: i, val: rsiValues[i] });
+      
+      let isRsiHigh = true;
+      for (let k = 1; k <= PIVOT_WINDOW; k++) {
+        if (rsiValues[i] < rsiValues[i - k] || rsiValues[i] < rsiValues[i + k]) {
+          isRsiHigh = false;
+          break;
+        }
+      }
+      if (isRsiHigh) rsiHighs.push({ idx: i, val: rsiValues[i] });
+    }
+  }
+  
+  // Bullish divergence
+  if (priceLows.length >= 2 && rsiLows.length >= 2) {
+    let p1 = priceLows[priceLows.length - 2];
+    let p2 = priceLows[priceLows.length - 1];
+    let r1 = rsiLows[rsiLows.length - 2];
+    let r2 = rsiLows[rsiLows.length - 1];
+    
+    if (Math.abs(p2.idx - r2.idx) < 8 && Math.abs(p1.idx - r1.idx) < 8) {
+      if (p2.val < p1.val && r2.val > r1.val) {
+        bullishDivergence = true;
+        divInfo = `Bullish divergence (price LL + RSI HL)`;
+      }
+    }
+  }
+  
+  // Bearish divergence
+  if (priceHighs.length >= 2 && rsiHighs.length >= 2) {
+    let p1 = priceHighs[priceHighs.length - 2];
+    let p2 = priceHighs[priceHighs.length - 1];
+    let r1 = rsiHighs[rsiHighs.length - 2];
+    let r2 = rsiHighs[rsiHighs.length - 1];
+    
+    if (Math.abs(p2.idx - r2.idx) < 8 && Math.abs(p1.idx - r1.idx) < 8) {
+      if (p2.val > p1.val && r2.val < r1.val) {
+        bearishDivergence = true;
+        divInfo = `Bearish divergence (price HH + RSI LH)`;
+      }
+    }
+  }
+}
+
 function draw() {
   background(18);
   
-  // Leave space for the input controls at the top
   fill(230);
   textSize(18);
-  text(`${currentSymbol} – Price + RSI + Markov (Softmax T=${TEMPERATURE})`, 40, 70);
+  text(`${currentSymbol} – Price + RSI + Markov + Divergence`, 40, 70);
   textSize(12);
   text(`Last ${closes.length} trading days  |  RSI period: ${RSI_PERIOD}`, 40, 90);
   
@@ -167,27 +254,32 @@ function draw() {
   drawPriceChart(40, 110, width - 80, 200);
   drawRSIChart(40, 335, width - 80, 130);
   
-  // Today's price + estimated tomorrow price
+  if (bullishDivergence || bearishDivergence) {
+    if (bullishDivergence) fill(80, 255, 120);
+    else fill(255, 100, 100);
+    textSize(14);
+    text(`⚠ ${divInfo}`, 40, 485);
+  }
+  
   let todayClose = closes[closes.length - 1];
   let change = estimatedTomorrow - todayClose;
   let changePct = (change / todayClose) * 100;
   
   fill(230);
   textSize(14);
-  text(`Today: $${nf(todayClose, 0, 2)}`, 40, 500);
+  text(`Today: $${nf(todayClose, 0, 2)}`, 40, 515);
   
   if (change >= 0) fill(80, 220, 120);
   else fill(255, 100, 100);
-  
-  text(`Est. Tomorrow: $${nf(estimatedTomorrow, 0, 2)}  (${change >= 0 ? '+' : ''}${nf(changePct, 1, 2)}%)`, 280, 500);
+  text(`Est. Tomorrow: $${nf(estimatedTomorrow, 0, 2)}  (${change >= 0 ? '+' : ''}${nf(changePct, 1, 2)}%)`, 280, 515);
   
   fill(230);
   textSize(13);
-  text(`Last state: ${markov.lastState}   |   σ = ${nf(markov.std * 100, 1, 2)}%`, 40, 530);
+  text(`Last state: ${markov.lastState}   |   σ = ${nf(markov.std * 100, 1, 2)}%`, 40, 545);
   
-  let y = 565;
+  let y = 580;
   textSize(12);
-  text('Tomorrow probability distribution (Softmax):', 40, y);
+  text('Tomorrow probability distribution:', 40, y);
   y += 18;
   
   for (let p of tomorrowProbs) {
@@ -198,7 +290,7 @@ function draw() {
     y += 17;
   }
   
-  drawCompactMatrix(420, 565);
+  drawCompactMatrix(420, 580);
 }
 
 function drawPriceChart(x, y, w, h) {
@@ -227,6 +319,19 @@ function drawPriceChart(x, y, w, h) {
     vertex(px, py);
   }
   endShape();
+  
+  if (bullishDivergence) {
+    fill(80, 255, 120);
+    noStroke();
+    textSize(14);
+    text('▲ Bullish Div', x + w - 130, y + h - 15);
+  }
+  if (bearishDivergence) {
+    fill(255, 100, 100);
+    noStroke();
+    textSize(14);
+    text('▼ Bearish Div', x + w - 130, y + 30);
+  }
   
   fill(80, 180, 255);
   noStroke();
@@ -282,6 +387,19 @@ function drawRSIChart(x, y, w, h) {
   }
   endShape();
   
+  if (bullishDivergence) {
+    fill(80, 255, 120);
+    noStroke();
+    textSize(13);
+    text('▲ Bullish', x + w - 100, y + h - 15);
+  }
+  if (bearishDivergence) {
+    fill(255, 100, 100);
+    noStroke();
+    textSize(13);
+    text('▼ Bearish', x + w - 100, y + 30);
+  }
+  
   let lastRSI = rsiValues[rsiValues.length - 1];
   if (lastRSI != null) {
     fill(200, 120, 255);
@@ -298,7 +416,7 @@ function drawCompactMatrix(x, y) {
   
   fill(180);
   textSize(11);
-  text('Transition Matrix (Softmax)', x, y - 6);
+  text('Transition Matrix', x, y - 6);
   
   for (let r = 0; r < 7; r++) {
     for (let c = 0; c < 7; c++) {
@@ -385,37 +503,27 @@ class MarkovTree {
     this.lastState = this.states[this.states.length - 1];
   }
   
-  softmax(scores, temperature = 1.0) {
-    let maxScore = Math.max(...scores);
-    let exps = scores.map(s => Math.exp((s - maxScore) / temperature));
-    let sum = exps.reduce((a, b) => a + b, 0);
-    return exps.map(e => e / sum);
-  }
-  
   getTransitionProb(from, to) {
     let counts = this.transitions[from] || {};
-    let scores = this.allStates.map(s => (counts[s] || 0) + 0.1);
-    let probs = this.softmax(scores, TEMPERATURE);
-    let idx = this.allStates.indexOf(to);
-    return idx >= 0 ? probs[idx] : 0;
+    let total = Object.values(counts).reduce((a, b) => a + b, 0);
+    if (total === 0) return 0;
+    return (counts[to] || 0) / total;
   }
   
   predictTomorrow() {
     let from = this.lastState;
     let counts = this.transitions[from] || {};
+    let total = Object.values(counts).reduce((a, b) => a + b, 0);
     let currentPrice = this.prices[this.prices.length - 1];
-    
-    let scores = this.allStates.map(s => (counts[s] || 0) + 0.1);
-    let probs = this.softmax(scores, TEMPERATURE);
-    
     let result = [];
-    for (let i = 0; i < this.allStates.length; i++) {
-      let s = this.allStates[i];
+    
+    for (let s of this.allStates) {
+      let prob = total === 0 ? 1 / this.allStates.length : (counts[s] || 0) / total;
       let avgRet = this.stateReturns[s] || 0;
       
       result.push({
         state: s,
-        prob: probs[i],
+        prob: prob,
         estimatedPrice: currentPrice * (1 + avgRet)
       });
     }
