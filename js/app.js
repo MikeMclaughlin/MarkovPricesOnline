@@ -17,7 +17,7 @@ let meanReturn = 0;
 let stdReturn = 0;
 
 const STATE_LABELS = ["-3σ", "-2σ", "-1σ", "Flat", "+1σ", "+2σ", "+3σ"];
-const LOOKBACK = 252; // trading days
+const LOOKBACK = 200; // trading days
 
 function setup() {
   createCanvas(1100, 920);
@@ -36,6 +36,8 @@ function setup() {
   statusText.position(220, 12);
   statusText.style("color", "#aaa");
   statusText.style("font-family", "monospace");
+
+  loadStock();
 }
 
 function draw() {
