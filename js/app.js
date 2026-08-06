@@ -16,6 +16,7 @@ let expectedNextClose = 0;
 let meanReturn = 0;
 let stdReturn = 0;
 
+
 const STATE_LABELS = ["-3σ", "-2σ", "-1σ", "Flat", "+1σ", "+2σ", "+3σ"];
 const LOOKBACK = 200; // trading days
 
