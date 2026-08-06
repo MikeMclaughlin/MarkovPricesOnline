@@ -84,7 +84,7 @@ async function loadStock() {
 
   try {
     // Using corsproxy to avoid CORS issues with Yahoo Finance
-    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1d&range=2y`;
+    const url = `https://corsproxy.io/?https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1d&range=2y`;
     const res = await fetch(url);
     const data = await res.json();
 
